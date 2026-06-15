@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+########################################
+# Configuration
+########################################
+
+RECONNECT_DELAY=3   # seconds before reconnect attempt
+
+########################################
+# Arguments
+########################################
+
+HOST=""         # remote server
+SESSION=""      # tmux session on remote server
+PROXY=""        # proxy to ssh through
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --session)
+            SESSION="${2:-}"
+            shift 2
+            ;;
+        --proxy)
+            PROXY="${2:-}"
+            shift 2
+            ;;
+        *)
+            if [[ -z "$HOST" ]]; then
+                HOST="$1"
+            else
+                echo "[!] Unexpected argument: $1" >&2
+                echo "Usage:"
+                echo "  rssh <host> [--session name] [--proxy host:port]"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+########################################
+# Usage check
+########################################
+
+if [[ -z "$HOST" ]]; then
+    echo "Usage:"
+    echo "  rssh <host> [--session name] [--proxy host:port]"
+    exit 1
+fi
+
+########################################
+# Cleanup terminal state on exit/signals
+########################################
+
+cleanup_terminal() {                        # restore terminal after broken SSH/proxy
+    stty sane 2>/dev/null || true           # reset echo, signals, line editing, CR/LF behavior, 
+    tput sgr0 2>/dev/null || true           # reset ANSI formatting
+    }
+
+trap 'cleanup_terminal; echo; echo "[!] Interrupted."; exit 130' INT TERM   # catches the Ctrl-C
+trap 'cleanup_terminal' EXIT HUP            # run cleanup when exiting, Ctrl+C, terminal closes, kill signal received
+
+########################################
+# Wait until proxy becomes reachable
+########################################
+
+wait_for_proxy() {                         # prevent endless SSH failures.
+
+    local max_attempts=10
+    local attempt=0
+
+    while (( attempt++ < max_attempts )); do
+
+        if nc -X 5 -x "${PROXY_HOST}:${PROXY_PORT}" -z google.com 443 >/dev/null 2>&1; then
+            echo "Proxy connected."
+            echo
+            return 0
+        fi
+        
+        echo "[!] Proxy unreachable: ${PROXY_HOST}:${PROXY_PORT} (attempt $attempt/$max_attempts)"
+        echo "[!] Waiting 5 seconds before retry..."
+        echo
+        
+        sleep 5   
+    done
+
+    return 1
+}
+
+########################################
+# SSH options
+########################################
+
+SSH_OPTIONS=(
+-o "ServerAliveInterval=10"
+-o "ServerAliveCountMax=2"
+-o "TCPKeepAlive=yes"
+-o "Compression=yes"
+-o "ControlMaster=auto"
+-o "ControlPersist=1m"
+-o "ControlPath=~/.ssh/control-%r@%h:%p"
+-o "ConnectTimeout=10"
+)
+
+########################################
+# Main reconnect loop
+########################################
+
+while true; do
+
+    cleanup_terminal
+
+    echo
+    echo "========================================"
+    echo " Host          : $HOST"
+    echo " tmux Session  : $SESSION"
+    echo " Proxy         : $PROXY"
+    echo "========================================"
+    echo
+
+    ########################################
+    # Ensure proxy is reachable (Only if provided)
+    ########################################
+
+    if [[ -n "$PROXY" ]]; then
+
+        PROXY_HOST="${PROXY%:*}"
+        PROXY_PORT="${PROXY##*:}"
+
+        wait_for_proxy
+
+        if [[ $? -eq !0 ]]; then
+            echo "Proxy not reachable."
+            echo "Terminated."
+            exit 100
+        fi
+
+    fi
+
+    ########################################
+    # Connect and attach tmux
+    ########################################
+
+    SSH_CMD=(ssh -tt)
+
+    [[ -n "$PROXY" ]] && SSH_CMD+=(-o "ProxyCommand=nc -X 5 -x $PROXY %h %p")
+    SSH_CMD+=("${SSH_OPTIONS[@]}")
+    SSH_CMD+=("--" "$HOST")
+
+    if [[ -n "$SESSION" ]]; then
+        "${SSH_CMD[@]}" "
+        export TERM=xterm-256color;
+        stty intr '^C' quit '^\' eof '^D' kill '^U';
+        tmux new-session -A -D -s $(printf '%q' "$SESSION")
+        "
+    else
+        "${SSH_CMD[@]}" "
+        export TERM=xterm-256color;
+        stty intr '^C' quit '^\' eof '^D' kill '^U';
+        "
+    fi
+    
+    ########################################
+    # Restore terminal after disconnect
+    ########################################
+
+    SSH_EXIT_CODE=$?
+
+    cleanup_terminal
+
+    if [[ $SSH_EXIT_CODE -eq 0 ]]; then
+
+        echo
+        echo "[+] Clean disconnect"
+        echo "[+] Exiting rssh"
+        echo
+
+        exit 0
+    fi
+
+    echo
+    echo "[!] SSH disconnected"
+    echo "[!] Exit code: ${SSH_EXIT_CODE}"
+    echo "[!] Reconnecting in ${RECONNECT_DELAY}s..."
+    echo
+
+    sleep "$RECONNECT_DELAY"
+
+done
